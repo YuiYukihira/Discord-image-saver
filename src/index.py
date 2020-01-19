@@ -90,7 +90,7 @@ class Upload:
             self.__embed = (
                 discord.Embed(title=f"channel: {self.message.channel} -> {self.user}")
                 .set_image(url=self.pictures[0].attachment.url)
-                .add_field(name="status", value=f"❓")
+                .add_field(name="status", value=f"❓ - Uploading")
             )
             self.__message = await self.bot.get_user(self.bot.owner_id).send(
                 embed=self.__embed
@@ -174,7 +174,9 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
         bot,
         client_id,
         client_secret,
-        redirect_uri,
+        aiohttp_address,
+        callback_address,
+        port,
         loop=None,
         users=None,
         watching=None,
@@ -182,7 +184,7 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
         self.loop = loop if loop else asyncio.get_event_loop()
         self.bot = bot
         self.google = GoogleClient(
-            client_id=client_id, client_secret=client_secret, redirect_uri=redirect_uri
+            client_id=client_id, client_secret=client_secret, redirect_uri=f'http://{callback_address}:{port}/callback'
         )
         self.users = (
             self.load_users(users, self.google, loop=self.loop) if users else {}
@@ -194,7 +196,7 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
         self.upload.start()
         self.runner = web.AppRunner(app)
         self.loop.run_until_complete(self.runner.setup())
-        site = web.TCPSite(self.runner, "0.0.0.0", 8080)
+        site = web.TCPSite(self.runner, aiohttp_address, 8080)
         self.web_task = asyncio.Task(site.start(), loop=loop)
         self.loggingOn = False
 
@@ -376,13 +378,13 @@ if __name__ == "__main__":
 
     loop = asyncio.get_event_loop()
 
-    config = json.load(open("config.json", "r"))
+    config = json.load(open("/config.json", "r"))
     try:
-        users = json.load(open("users.json", "r"))
+        users = json.load(open(config["users_file"], "r"))
     except FileNotFoundError:
         users = None
     try:
-        watching = json.load(open("watching.json", "r"))
+        watching = json.load(open(config["watching_file"], "r"))
     except FileNotFoundError:
         watching = None
     bot = commands.Bot(command_prefix="!")
@@ -391,7 +393,9 @@ if __name__ == "__main__":
             bot,
             config["client_id"],
             config["client_secret"],
-            config["redirect_uri"],
+            config["aiohttp_address"],
+            config["callback_address"],
+            config["port"],
             loop=loop,
             users=users,
             watching=watching,
