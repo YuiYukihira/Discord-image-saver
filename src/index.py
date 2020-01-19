@@ -1,156 +1,155 @@
 from aioauth_client import GoogleClient
-from discord.ext import commands
+from discord.ext import tasks, commands
 from aiohttp import web
 import aiohttp
 import asyncio
 
-users = {}
-watching = {}
-upload_queue = asyncio.Queue()
+class ImageSaverCog(commands.Cog, name='Image saver cog'):
+    def __init__(self, bot, client_id, client_secret, redirect_uri, loop=None):
+        self.loop = loop if loop else asyncio.get_event_loop()
+        if not loop:
+            self.loop = asyncio.get_event_loop()
+        else:
+            self.loop = loop
+        self.bot = bot
+        self.users = {}
+        self.watching = {}
+        self.upload_queue = asyncio.Queue()
+        self.google = GoogleClient(
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri
+        )
+        app = web.Application()
+        app.add_routes([web.get('/callback', self.callback)])
+        self.upload.start()
+        self.runner = web.AppRunner(app)
+        self.loop.run_until_complete(self.runner.setup())
+        site = web.TCPSite(self.runner, '0.0.0.0', 8080)
+        self.web_task = asyncio.Task(site.start(), loop=loop)
 
-bot = commands.Bot(command_prefix="!")
-google = GoogleClient(
-    client_id="",
-    client_secret="",
-    redirect_uri="http://127.0.0.1:8080/callback",
-)
-run = True
+    def cog_unload(self):
+        self.upload.cancel()
+        self.loop.run_until_complete(self._stop())
+
+    async def _stop(self):
+        await self.runner.cleanup()
+        await self.web_task
 
 
-async def upload():
-    while run:
-        a = await upload_queue.get()
+    @tasks.loop()
+    async def upload(self):
+        u = await asyncio.wait_for(self.upload_queue.get(), 10)
         upload_tokens = []
-        print(a)
-        async with aiohttp.ClientSession(
-            headers={"Authorization": f"Bearer {a['bearer']}"}
-        ) as session:
-            for pic in a['pictures']:
-                async with session.post(
-                    "https://photoslibrary.googleapis.com/v1/uploads",
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {u['bearer']}"}) as session:
+            for pic in u['pictures']:
+                async with session.post("https://photoslibrary.googleapis.com/v1/uploads",
                     data=await pic["attachment"].read(),
                     headers={
-                        "Content-type": "application/octect-stream",
-                        "X-Goog-Upload-File-Name": pic["attachment"].filename,
-                        "X-Goog-Upload-Protocol": "raw",
-                    },
-                ) as resp:
-                    print(resp.status)
-                    if resp.status == 200:
-                        upload_tokens.append(
-                            {"desc": pic['description'], "token": await resp.text()}
-                        )
+                        "Content-Type": "application/octect-stream",
+                        "X-Goog-Upload-File-Name": pic['attachment'].filename,
+                        "X-Goog-Upload-Protocol": "raw"
+                    }) as resp:
+                        if resp.status == 200:
+                            upload_tokens.append(
+                                {"description": pic['description'], "token": await resp.text()}
+                            )
             if len(upload_tokens) > 0:
                 async with session.post(
                     "https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate",
                     json={
                         "newMediaItems": [
-                            {
-                                "description": t['desc'],
-                                "simpleMediaItem": {"uploadToken": t['token']},
-                            }
-                            for t in upload_tokens
+                            {"description": t['description'],
+                            "simpleMediaItem": {"uploadToken": t['token']}
+                            } for t in upload_tokens
                         ]
-                    },
-                    headers={"Content-Type": "application/json"},
+                    }
                 ) as resp:
-                    print(resp.status)
+                    await u['message'].remove_reaction('❓', self.bot.user)
                     if resp.status == 200:
-                        print("success")
-                    if resp.status == 400:
-                        print(await resp.text())
-
-
-app = web.Application()
-
-
-async def start_bot(app):
-    asyncio.create_task(
-        bot.start("")
-    )
-    asyncio.create_task(upload())
-
-
-async def stop_bot(app):
-    global run
-    run = False
-    await bot.close()
-
-
-@bot.command()
-async def login(ctx):
-    id = ctx.author.id
-    authorize_url = google.get_authorize_url(
-        scope="https://www.googleapis.com/auth/photoslibrary.appendonly", state=str(id)
-    )
-    await ctx.author.send(f"Login with google here: {authorize_url}")
-
-
-@bot.command()
-async def watch(ctx, user: commands.UserConverter):
-    print(user.id)
-    if not watching.get(ctx.channel.id):
-        watching[ctx.channel.id] = {}
-    if not watching.get(ctx.channel.id).get(ctx.author.id):
-        watching[ctx.channel.id][user.id] = []
-    watching[ctx.channel.id][user.id].append(ctx.author.id)
-    print(watching)
-    await ctx.send(f'I\'m watching {user} for images in this channel to upload to {ctx.author}\'s google photos i')
-
-
-@bot.event
-async def on_message(message):
-    channel = watching.get(message.channel.id)
-    if channel:
-        u = channel.get(message.author.id)
-        if u:
-            for code in users:
-                if code:
-                    if message.content and len(message.attachments) == 1:
-                        await upload_queue.put(
-                            {
-                                "bearer": users[code],
-                                "pictures": [
-                                    {
-                                        "description": message.content,
-                                        "attachment": message.attachments[0],
-                                    }
-                                ],
-                            }
-                        )
+                        await u['message'].add_reaction('✔️')
+                    elif resp.status == 407:
+                        await u['message'].add_reaction('➖')
                     else:
-                        await upload_queue.put(
-                            {
-                                "bearer": code,
-                                "pictures": [
-                                    {"description": a.filename, "attachment": a}
-                                    for a in message.attachments
-                                ],
-                            }
-                        )
-    await bot.process_commands(message)
+                        await u['message'].add_reaction('❌')
 
+    @commands.Command
+    async def login(self, ctx):
+        id = ctx.author.id
+        authorize_url = self.google.get_authorize_url(
+            scope="https://www.googleapis.com/auth/photoslibrary.appendonly", state=str(id)
+        )
+        await ctx.author.send(f"Login with google here: {authorize_url}")
 
-async def callback(request):
-    id = request.query.get("state")
-    code = request.query.get("code")
-    print(code)
-    try:
-        otoken, _ = await google.get_access_token(code)
-    except web.HTTPBadRequest as e:
-        print(f"whoops {str(e)}, {e.reason}")
-    else:
-        print(otoken)
-        users[id] = otoken
-        return web.Response(text=str(otoken))
-    return web.Response(text="none")
+    @commands.Command
+    async def watch(self, ctx, user: commands.UserConverter):
+        if not self.watching.get(ctx.channel.id):
+            self.watching[ctx.channel.id] = {}
+        if not self.watching.get(ctx.channel.id).get(user.id):
+            self.watching[ctx.channel.id][user.id] = []
+        if not ctx.author.id in self.watching.get(ctx.channel.id).get(user.id):
+            self.watching[ctx.channel.id][user.id].append(ctx.author.id)
+        await ctx.send(f"I'm watching {user} for images in this channel to upload to {ctx.author}'s google photos library'")
 
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        # are we watching this channel?
+        if message.author != self.bot.user:
+            channel = self.watching.get(message.channel.id)
+            if channel:
+                # are we watching any users in this channel?
+                users = channel.get(message.author.id, [])
+                # upload for all users we're watching for.
+                for user_id in users:
+                    if user_id in self.users.keys():
+                        # Message has title + 1 picture
+                        if message.content and len(message.attachments) == 1:
+                            await message.add_reaction('❓')
+                            await self.upload_queue.put({
+                                "bearer": self.users[user_id],
+                                "pictures": [{
+                                    "description": message.content,
+                                    "attachment": message.attachments[0]
+                                }],
+                                "message": message,
+                                "user": self.bot.get_user(user_id)
+                            })
+                        elif len(message.attachments) > 0:
+                            await message.add_reaction('❓')
+                            await self.upload_queue.put({
+                                "bearer": self.users[user_id],
+                                "pictures": [{
+                                    "description": a.filename,
+                                    "attachment": a
+                                } for a in message.attachments],
+                                "message": message,
+                                "user": self.bot.get_uer(user_id)
+                            })
+        
+    @commands.Command
+    @commands.is_owner()
+    async def stop(self, ctx):
+        await self.bot.logout()
 
-async def check(request):
-    return web.Response(text=str(users))
+    @commands.Command
+    @commands.is_owner()
+    async def check(self, ctx):
+        await ctx.author.send(f'users: {self.users}')
+        await ctx.author.send(f'watching: {self.watching}')
 
+    async def callback(self, request):
+        user_id = request.query.get('state')
+        code = request.query.get('code')
+        otoken, _ = await self.google.get_access_token(code)
+        self.users[int(user_id)] = otoken
+        return web.Response(text='Thank you, you can now close this tab and go back to discord')
 
-app.on_startup.append(start_bot)
-app.on_shutdown.append(stop_bot)
-app.add_routes([web.get("/callback", callback), web.get("/check", check)])
-web.run_app(app)
+if __name__ == '__main__':
+    import json
+
+    loop = asyncio.get_event_loop()
+
+    config = json.load(open('config.json', 'r'))
+    bot = commands.Bot(command_prefix="!")
+    bot.add_cog(ImageSaverCog(bot, config['client_id'], config['client_secret'], config['redirect_uri'], loop=loop))
+    bot.run(config['discord_token'])
