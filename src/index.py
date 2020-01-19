@@ -11,22 +11,45 @@ class ImageSaverCog(commands.Cog, name='Image saver cog'):
             self.loop = asyncio.get_event_loop()
         else:
             self.loop = loop
+class ImageSaverCog(commands.Cog, name="Image saver cog"):
+    def __init__(
+        self,
+        bot,
+        client_id,
+        client_secret,
+        redirect_uri,
+        loop=None,
+        users=None,
+        watching=None,
+    ):
+        self.loop = loop if loop else asyncio.get_event_loop()
         self.bot = bot
-        self.users = {}
-        self.watching = {}
+        self.users = self.load_users(users) if users else {}
+        self.watching = self.load_watching(watching) if watching else {}
         self.upload_queue = asyncio.Queue()
         self.google = GoogleClient(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=redirect_uri
+            client_id=client_id, client_secret=client_secret, redirect_uri=redirect_uri
         )
         app = web.Application()
-        app.add_routes([web.get('/callback', self.callback)])
+        app.add_routes([web.get("/callback", self.callback)])
         self.upload.start()
         self.runner = web.AppRunner(app)
         self.loop.run_until_complete(self.runner.setup())
-        site = web.TCPSite(self.runner, '0.0.0.0', 8080)
+        site = web.TCPSite(self.runner, "0.0.0.0", 8080)
         self.web_task = asyncio.Task(site.start(), loop=loop)
+
+    @staticmethod
+    def load_users(json):
+        return {int(user): token for user, token in json.items()}
+
+    @staticmethod
+    def load_watching(json):
+        return {
+            int(channel): {
+                int(author_id): user_id for author_id, user_id in users.items()
+            }
+            for channel, users in json.items()
+        }
 
     def cog_unload(self):
         self.upload.cancel()
@@ -35,7 +58,13 @@ class ImageSaverCog(commands.Cog, name='Image saver cog'):
     async def _stop(self):
         await self.runner.cleanup()
         await self.web_task
+        self.save()
 
+    def save(self):
+        with open("users.json", "w") as f:
+            json.dump(self.users, f)
+        with open("watching.json", "w") as f:
+            json.dump(self.watching, f)
 
     @tasks.loop()
     async def upload(self):
@@ -77,7 +106,8 @@ class ImageSaverCog(commands.Cog, name='Image saver cog'):
     async def login(self, ctx):
         id = ctx.author.id
         authorize_url = self.google.get_authorize_url(
-            scope="https://www.googleapis.com/auth/photoslibrary.appendonly", state=str(id)
+            scope="https://www.googleapis.com/auth/photoslibrary.appendonly",
+            state=str(id),
         )
         await ctx.author.send(f"Login with google here: {authorize_url}")
 
@@ -126,30 +156,51 @@ class ImageSaverCog(commands.Cog, name='Image saver cog'):
                                 "user": self.bot.get_uer(user_id)
                             })
         
-    @commands.Command
+    @commands.command()
     @commands.is_owner()
     async def stop(self, ctx):
         await self.bot.logout()
 
-    @commands.Command
+    @commands.command()
     @commands.is_owner()
     async def check(self, ctx):
         await ctx.author.send(f'users: {self.users}')
         await ctx.author.send(f'watching: {self.watching}')
 
     async def callback(self, request):
-        user_id = request.query.get('state')
-        code = request.query.get('code')
+        user_id = request.query.get("state")
+        code = request.query.get("code")
         otoken, _ = await self.google.get_access_token(code)
         self.users[int(user_id)] = otoken
-        return web.Response(text='Thank you, you can now close this tab and go back to discord')
+        return web.Response(
+            text="Thank you, you can now close this tab and go back to discord"
+        )
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     import json
 
     loop = asyncio.get_event_loop()
 
-    config = json.load(open('config.json', 'r'))
+    config = json.load(open("config.json", "r"))
+    try:
+        users = json.load(open("users.json", "r"))
+    except FileNotFoundError:
+        users = None
+    try:
+        watching = json.load(open("watching.json", "r"))
+    except FileNotFoundError:
+        watching = None
     bot = commands.Bot(command_prefix="!")
-    bot.add_cog(ImageSaverCog(bot, config['client_id'], config['client_secret'], config['redirect_uri'], loop=loop))
-    bot.run(config['discord_token'])
+    bot.add_cog(
+        ImageSaverCog(
+            bot,
+            config["client_id"],
+            config["client_secret"],
+            config["redirect_uri"],
+            loop=loop,
+            users=users,
+            watching=watching,
+        )
+    )
+    bot.run(config["discord_token"])
