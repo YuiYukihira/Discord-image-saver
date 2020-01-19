@@ -160,12 +160,13 @@ class Upload:
                 self.__embed = self.__embed.set_field_at(
                     0, name="status", value=f"❌ - Unsuccessful"
                 ).add_field(name="details2", value=f"{await response.text()}")
-        if not self.__message:
-            self.__message = await self.bot.get_user(self.bot.owner_id).send(
-                embed=self.__embed
-            )
-        else:
-            await self.__message.edit(embed=self.__embed)
+        if self.logging:
+            if not self.__message:
+                self.__message = await self.bot.get_user(self.bot.owner_id).send(
+                    embed=self.__embed
+                )
+            else:
+                await self.__message.edit(embed=self.__embed)
 
 
 class ImageSaverCog(commands.Cog, name="Image saver cog"):
