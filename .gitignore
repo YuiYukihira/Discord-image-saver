@@ -133,3 +133,6 @@ dmypy.json
 config.json
 users.json
 watching.json
+
+## VScode stuff
+.vscode
