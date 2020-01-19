@@ -1,16 +1,80 @@
 from aioauth_client import GoogleClient
 from discord.ext import tasks, commands
+import discord
 from aiohttp import web
 import aiohttp
 import asyncio
+from dataclasses import dataclass, field
 
-class ImageSaverCog(commands.Cog, name='Image saver cog'):
-    def __init__(self, bot, client_id, client_secret, redirect_uri, loop=None):
-        self.loop = loop if loop else asyncio.get_event_loop()
-        if not loop:
-            self.loop = asyncio.get_event_loop()
+from typing import Optional, List
+
+
+@dataclass
+class Picture:
+    description: Optional[str]
+    attachment: discord.Attachment
+
+
+@dataclass
+class Upload:
+    bot: commands.Bot
+    pictures: List[Picture]
+    message: discord.Message
+    bearer: str
+    user: discord.User
+    logging: bool
+
+    __embed: Optional[discord.Embed] = field(init=False)
+    __message: Optional[discord.Message] = field(init=False)
+
+    async def log(self):
+        if self.logging:
+            self.__embed = (
+                discord.Embed(title=f"channel: {self.message.channel} -> {self.user}")
+                .set_image(url=self.pictures[0].attachment.url)
+                .add_field(name="status", value=f"❓")
+            )
+            self.__message = await self.bot.get_user(self.bot.owner_id).send(
+                embed=self.__embed
+            )
+        await self.message.add_reaction("❓")
+
+    async def log2(self, msg):
+        await self.bot.get_user(self.bot.owner_id).send(msg)
+
+    async def update1(self, response):
+        if response.status != 200:
+            await self.message.add_reaction("🚫")
+            if self.logging:
+                self.__embed.set_field_at(
+                    0, name="status", value="🚫 - Could not upload images to google"
+                ).add_field(
+                    name="details1",
+                    value=f"{response.status} {response.reason}: {await response.text()}",
+                )
+                await self.__message.edit(embed=self.__embed)
+
+    async def update2(self, response):
+        await self.message.remove_reaction("❓", self.bot.user)
+        if response.status == 200 or response.status == 407:
+            emoji, m = (
+                ("✔️", "All saved successfully")
+                if response.status == 200
+                else ("➖", "Some saved successfully")
+            )
+            await self.message.add_reaction(emoji)
+            if self.logging:
+                self.__embed = self.__embed.set_field_at(
+                    0, name="status", value=f"{emoji} - {m}"
+                )
         else:
-            self.loop = loop
+            await self.message.add_reaction("❌")
+            self.__embed = self.__embed.set_field_at(
+                0, name="status", value=f"❌ - Unsuccessful"
+            ).add_field(name="details2", value=f"{await response.text()}")
+        await self.__message.edit(embed=self.__embed)
+
+
 class ImageSaverCog(commands.Cog, name="Image saver cog"):
     def __init__(
         self,
@@ -37,6 +101,7 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
         self.loop.run_until_complete(self.runner.setup())
         site = web.TCPSite(self.runner, "0.0.0.0", 8080)
         self.web_task = asyncio.Task(site.start(), loop=loop)
+        self.loggingOn = False
 
     @staticmethod
     def load_users(json):
@@ -68,39 +133,40 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
 
     @tasks.loop()
     async def upload(self):
-        u = await asyncio.wait_for(self.upload_queue.get(), 10)
+        u = await self.upload_queue.get()
         upload_tokens = []
-        async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {u['bearer']}"}) as session:
-            for pic in u['pictures']:
-                async with session.post("https://photoslibrary.googleapis.com/v1/uploads",
-                    data=await pic["attachment"].read(),
+        async with aiohttp.ClientSession(
+            headers={"Authorization": f"Bearer {u.bearer}"}
+        ) as session:
+            for pic in u.pictures:
+                async with session.post(
+                    "https://photoslibrary.googleapis.com/v1/uploads",
+                    data=await pic.attachment.read(),
                     headers={
                         "Content-Type": "application/octect-stream",
-                        "X-Goog-Upload-File-Name": pic['attachment'].filename,
-                        "X-Goog-Upload-Protocol": "raw"
-                    }) as resp:
-                        if resp.status == 200:
-                            upload_tokens.append(
-                                {"description": pic['description'], "token": await resp.text()}
-                            )
+                        "X-Goog-Upload-File-Name": pic.attachment.filename,
+                        "X-Goog-Upload-Protocol": "raw",
+                    },
+                ) as resp:
+                    await u.update1(resp)
+                    if resp.status == 200:
+                        upload_tokens.append(
+                            {"description": pic.description, "token": await resp.text()}
+                        )
             if len(upload_tokens) > 0:
                 async with session.post(
                     "https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate",
                     json={
                         "newMediaItems": [
-                            {"description": t['description'],
-                            "simpleMediaItem": {"uploadToken": t['token']}
-                            } for t in upload_tokens
+                            {
+                                "description": t["description"],
+                                "simpleMediaItem": {"uploadToken": t["token"]},
+                            }
+                            for t in upload_tokens
                         ]
-                    }
+                    },
                 ) as resp:
-                    await u['message'].remove_reaction('❓', self.bot.user)
-                    if resp.status == 200:
-                        await u['message'].add_reaction('✔️')
-                    elif resp.status == 407:
-                        await u['message'].add_reaction('➖')
-                    else:
-                        await u['message'].add_reaction('❌')
+                    await u.update2(resp)
 
     @commands.Command
     async def login(self, ctx):
@@ -113,13 +179,18 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
 
     @commands.Command
     async def watch(self, ctx, user: commands.UserConverter):
-        if not self.watching.get(ctx.channel.id):
-            self.watching[ctx.channel.id] = {}
-        if not self.watching.get(ctx.channel.id).get(user.id):
-            self.watching[ctx.channel.id][user.id] = []
-        if not ctx.author.id in self.watching.get(ctx.channel.id).get(user.id):
-            self.watching[ctx.channel.id][user.id].append(ctx.author.id)
-        await ctx.send(f"I'm watching {user} for images in this channel to upload to {ctx.author}'s google photos library'")
+        channel_id = int(ctx.channel.id)
+        user_id = int(user.id)
+        author_id = int(ctx.author.id)
+        if not self.watching.get(channel_id):
+            self.watching[channel_id] = {}
+        if not self.watching.get(channel_id).get(user_id):
+            self.watching[channel_id][user_id] = []
+        if not author_id in self.watching.get(channel_id).get(user_id):
+            self.watching[channel_id][user_id].append(author_id)
+        await ctx.send(
+            f"I'm watching {user} for images in this channel to upload to {ctx.author}'s google photos library'"
+        )
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -134,28 +205,27 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
                     if user_id in self.users.keys():
                         # Message has title + 1 picture
                         if message.content and len(message.attachments) == 1:
-                            await message.add_reaction('❓')
-                            await self.upload_queue.put({
-                                "bearer": self.users[user_id],
-                                "pictures": [{
-                                    "description": message.content,
-                                    "attachment": message.attachments[0]
-                                }],
-                                "message": message,
-                                "user": self.bot.get_user(user_id)
-                            })
+                            upload = Upload(
+                                self.bot,
+                                [Picture(message.content, message.attachments[0])],
+                                message,
+                                self.users[user_id],
+                                self.bot.get_user(user_id),
+                                self.loggingOn,
+                            )
+                            await self.upload_queue.put(upload)
+                            await upload.log()
                         elif len(message.attachments) > 0:
-                            await message.add_reaction('❓')
-                            await self.upload_queue.put({
-                                "bearer": self.users[user_id],
-                                "pictures": [{
-                                    "description": a.filename,
-                                    "attachment": a
-                                } for a in message.attachments],
-                                "message": message,
-                                "user": self.bot.get_uer(user_id)
-                            })
-        
+                            upload = Upload(
+                                self.bot,
+                                [Picture(a.filename, a) for a in message.attachments],
+                                message,
+                                self.bot.get_user(user_id),
+                                self.loggingOn,
+                            )
+                            await self.upload_queue.put(upload)
+                            await upload.log()
+
     @commands.command()
     @commands.is_owner()
     async def stop(self, ctx):
@@ -164,8 +234,24 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
     @commands.command()
     @commands.is_owner()
     async def check(self, ctx):
-        await ctx.author.send(f'users: {self.users}')
-        await ctx.author.send(f'watching: {self.watching}')
+        await ctx.author.send(f"users: {self.users}")
+        await ctx.author.send(f"watching: {self.watching}")
+
+    @commands.group()
+    @commands.is_owner()
+    async def logging(self, ctx):
+        if ctx.invoked_subcommand is None:
+            await ctx.author.send("Invalid logging command")
+
+    @logging.command()
+    async def on(self, ctx):
+        self.loggingOn = True
+        await ctx.author.send("Logging turned on")
+
+    @logging.command()
+    async def off(self, ctx):
+        self.loggingOn = False
+        await ctx.author.send("Logging turned off")
 
     async def callback(self, request):
         user_id = request.query.get("state")
