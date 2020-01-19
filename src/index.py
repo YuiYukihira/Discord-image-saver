@@ -9,6 +9,64 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 
 
+class Token:
+    def __init__(
+        self,
+        token: str,
+        refresh_token: str,
+        expires_in: str,
+        oauth_client: GoogleClient,
+        loop=None,
+    ):
+        self.token = token
+        self.refresh_token = refresh_token
+        self.expires_in = expires_in
+        self.client = oauth_client
+        self.time_left = self.expires_in
+
+        self.__run = True
+        self.loop = loop if loop else asyncio.get_event_loop()
+
+        self.t = asyncio.Task(self.run(), loop=self.loop)
+
+    def __repr__(self):
+        return f"<Token token={self.token} refresh_token={self.refresh_token} expires_in={self.expires_in} time_left={self.time_left}>"
+
+    def __str__(self):
+        return self.token
+
+    async def stop(self):
+        self.__run = False
+        await self.t
+
+    async def run(self):
+        while self.__run:
+            await asyncio.sleep(1)
+            self.time_left -= 1
+            if self.time_left <= self.expires_in * 0.1:
+
+                self.token, meta = await self.client.get_access_token(
+                    self.refresh_token, loop=self.loop, grant_type="refresh_token"
+                )
+                if meta.get("refresh_token"):
+                    self.refresh_token = meta.get("refresh_token")
+                if meta.get("expires_in"):
+                    self.expires_in = meta.get("expires_in")
+                self.time_left = self.expires_in
+
+    def save(self):
+        return {
+            "token": self.token,
+            "refresh_token": self.refresh_token,
+            "expires_in": self.expires_in,
+        }
+
+    @classmethod
+    def load(cls, json, auth_client, loop=None):
+        loop = loop if loop else asyncio.get_event_loop()
+        return cls(json["token"], json["refresh_token"], 0, auth_client, loop)
+
+
 @dataclass
 class Picture:
     description: Optional[str]
@@ -20,7 +78,7 @@ class Upload:
     bot: commands.Bot
     pictures: List[Picture]
     message: discord.Message
-    bearer: str
+    bearer: Token
     user: discord.User
     logging: bool
 
@@ -46,13 +104,26 @@ class Upload:
         if response.status != 200:
             await self.message.add_reaction("🚫")
             if self.logging:
+                if not self.__embed:
+                    self.__embed = (
+                        discord.Embed(
+                            title=f"channel: {self.message.channel} -> {self.user}"
+                        )
+                        .set_image(url=self.pictures[0].attachment.url)
+                        .add_field(name="status", value=f"❓")
+                    )
                 self.__embed.set_field_at(
                     0, name="status", value="🚫 - Could not upload images to google"
                 ).add_field(
                     name="details1",
                     value=f"{response.status} {response.reason}: {await response.text()}",
                 )
-                await self.__message.edit(embed=self.__embed)
+                if not self.__message:
+                    self.__message = await self.bot.get_user(self.bot.owner_id).send(
+                        embed=self.__embed
+                    )
+                else:
+                    await self.__message.edit(embed=self.__embed)
 
     async def update2(self, response):
         await self.message.remove_reaction("❓", self.bot.user)
@@ -64,15 +135,37 @@ class Upload:
             )
             await self.message.add_reaction(emoji)
             if self.logging:
+                if not self.__embed:
+                    self.__embed = (
+                        discord.Embed(
+                            title=f"channel: {self.message.channel} -> {self.user}"
+                        )
+                        .set_image(url=self.pictures[0].attachment.url)
+                        .add_field(name="status", value=f"❓")
+                    )
                 self.__embed = self.__embed.set_field_at(
                     0, name="status", value=f"{emoji} - {m}"
                 )
         else:
             await self.message.add_reaction("❌")
-            self.__embed = self.__embed.set_field_at(
-                0, name="status", value=f"❌ - Unsuccessful"
-            ).add_field(name="details2", value=f"{await response.text()}")
-        await self.__message.edit(embed=self.__embed)
+            if self.logging:
+                if not self.__embed:
+                    self.__embed = (
+                        discord.Embed(
+                            title=f"channel: {self.message.channel} -> {self.user}"
+                        )
+                        .set_image(url=self.pictures[0].attachment.url)
+                        .add_field(name="status", value=f"❓")
+                    )
+                self.__embed = self.__embed.set_field_at(
+                    0, name="status", value=f"❌ - Unsuccessful"
+                ).add_field(name="details2", value=f"{await response.text()}")
+        if not self.__message:
+            self.__message = await self.bot.get_user(self.bot.owner_id).send(
+                embed=self.__embed
+            )
+        else:
+            await self.__message.edit(embed=self.__embed)
 
 
 class ImageSaverCog(commands.Cog, name="Image saver cog"):
@@ -88,12 +181,14 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
     ):
         self.loop = loop if loop else asyncio.get_event_loop()
         self.bot = bot
-        self.users = self.load_users(users) if users else {}
-        self.watching = self.load_watching(watching) if watching else {}
-        self.upload_queue = asyncio.Queue()
         self.google = GoogleClient(
             client_id=client_id, client_secret=client_secret, redirect_uri=redirect_uri
         )
+        self.users = (
+            self.load_users(users, self.google, loop=self.loop) if users else {}
+        )
+        self.watching = self.load_watching(watching) if watching else {}
+        self.upload_queue = asyncio.Queue()
         app = web.Application()
         app.add_routes([web.get("/callback", self.callback)])
         self.upload.start()
@@ -104,8 +199,12 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
         self.loggingOn = False
 
     @staticmethod
-    def load_users(json):
-        return {int(user): token for user, token in json.items()}
+    def load_users(json, auth_client, loop=None):
+        loop = loop if loop else asyncio.get_event_loop()
+        return {
+            int(user): Token.load(token, auth_client, loop)
+            for user, token in json.items()
+        }
 
     @staticmethod
     def load_watching(json):
@@ -126,8 +225,9 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
         self.save()
 
     def save(self):
+        users = {u: t.save() for u, t in self.users.items()}
         with open("users.json", "w") as f:
-            json.dump(self.users, f)
+            json.dump(users, f)
         with open("watching.json", "w") as f:
             json.dump(self.watching, f)
 
@@ -136,7 +236,7 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
         u = await self.upload_queue.get()
         upload_tokens = []
         async with aiohttp.ClientSession(
-            headers={"Authorization": f"Bearer {u.bearer}"}
+            headers={"Authorization": f"Bearer {str(u.bearer)}"}
         ) as session:
             for pic in u.pictures:
                 async with session.post(
@@ -174,6 +274,7 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
         authorize_url = self.google.get_authorize_url(
             scope="https://www.googleapis.com/auth/photoslibrary.appendonly",
             state=str(id),
+            access_type="offline",
         )
         await ctx.author.send(f"Login with google here: {authorize_url}")
 
@@ -220,6 +321,7 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
                                 self.bot,
                                 [Picture(a.filename, a) for a in message.attachments],
                                 message,
+                                self.users[user_id],
                                 self.bot.get_user(user_id),
                                 self.loggingOn,
                             )
@@ -256,8 +358,14 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
     async def callback(self, request):
         user_id = request.query.get("state")
         code = request.query.get("code")
-        otoken, _ = await self.google.get_access_token(code)
-        self.users[int(user_id)] = otoken
+        otoken, meta = await self.google.get_access_token(code)
+        self.users[int(user_id)] = Token(
+            otoken,
+            meta.get("refresh_token"),
+            meta.get("expires_in"),
+            self.google,
+            loop=self.loop,
+        )
         return web.Response(
             text="Thank you, you can now close this tab and go back to discord"
         )
