@@ -296,8 +296,17 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
             f"I'm watching {user} for images in this channel to upload to {ctx.author}'s google photos library'"
         )
 
-    @commands.Cog.listener()
-    async def on_message(self, message):
+    @commands.Command
+    async def history(self, ctx, limit: int = 100):
+        successes = 0
+        before = ctx.message.created_at
+        async for message in ctx.channel.history(before=before, limit=limit):
+            if successes >= limit:
+                break
+            if await self.try_message(message):
+                successes += 1
+
+    async def try_message(self, message: discord.Message) -> bool:
         # are we watching this channel?
         if message.author != self.bot.user:
             channel = self.watching.get(message.channel.id)
@@ -319,6 +328,7 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
                             )
                             await self.upload_queue.put(upload)
                             await upload.log()
+                            return True
                         elif len(message.attachments) > 0:
                             upload = Upload(
                                 self.bot,
@@ -330,6 +340,14 @@ class ImageSaverCog(commands.Cog, name="Image saver cog"):
                             )
                             await self.upload_queue.put(upload)
                             await upload.log()
+                            return True
+                return False
+                        
+
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        await self.try_message(message)
 
     @commands.command()
     @commands.is_owner()
